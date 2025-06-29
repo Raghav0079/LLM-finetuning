@@ -1,6 +1,33 @@
 # LLM finetuning
 # Language Model Finetuning with Unsloth
+## Overview
 
+This guide provides a step-by-step walkthrough for finetuning large language models (LLMs) using the [Unsloth](https://github.com/unslothai/unsloth) library. It covers the entire workflow, including setup, data preparation, training, inference, model saving, and deployment optimizations for both Qwen 2 7B and CodeGemma 7B models.
+
+---
+
+## Table of Contents
+
+- [Unsloth Library](#unsloth-library)
+- [Setup](#setup)
+- [Model Loading and PEFT Setup](#model-loading-and-peft-setup)
+- [Data Preparation](#data-preparation)
+- [Training](#training)
+- [Inference](#inference)
+- [Saving the Model](#saving-the-model)
+- [WandB Logging](#wandb-logging)
+- [CodeGemma 7B Finetuning](#codegemma-7b-finetuning)
+- [Merging and Quantization](#merging-and-quantization)
+- [Colab Notebook](#colab-notebook-)
+
+---
+
+> **Note:**  
+> - This README assumes familiarity with Python and basic machine learning concepts.  
+> - GPU acceleration is highly recommended for efficient training and inference.  
+> - For more details on Unsloth features and advanced usage, refer to the [official documentation](https://github.com/unslothai/unsloth).
+
+---
 This notebook demonstrates finetuning two different language models, Qwen 2 7B and CodeGemma 7B, using the Unsloth library for faster and more memory-efficient finetuning.
 
 ## Unsloth Library
@@ -16,7 +43,41 @@ The notebook starts by installing the necessary libraries, including `unsloth`, 
 ### Model Loading and PEFT Setup
 
 The Qwen 2 7B model is loaded using `FastLanguageModel.from_pretrained` with 4-bit quantization, which is optimized by Unsloth for faster loading and lower memory footprint. PEFT adapters are then applied using `FastLanguageModel.get_peft_model`, leveraging Unsloth's optimizations for PEFT training.
+### Qwen 2 7B Model Loading and PEFT Setup
 
+The Qwen 2 7B model is loaded using Unsloth's `FastLanguageModel.from_pretrained` method, which supports efficient 4-bit quantization for reduced memory usage and faster training. After loading, PEFT (Parameter-Efficient Fine-Tuning) adapters are applied using `FastLanguageModel.get_peft_model`, allowing for efficient adaptation of the model to new tasks with minimal additional parameters.
+
+```python
+from unsloth import FastLanguageModel
+
+max_seq_length = 4096  # Adjust as needed for your use case
+dtype = None  # Auto-detects the best dtype (float16/bfloat16)
+load_in_4bit = True  # Enables 4-bit quantization
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "unsloth/qwen2-7b-bnb-4bit",  # Replace with your preferred Qwen 2 7B model
+    max_seq_length = max_seq_length,
+    dtype = dtype,
+    load_in_4bit = load_in_4bit,
+    # token = "hf_..."  # Use if accessing gated models
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 16,  # LoRA rank, adjust based on resources and task
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"],
+    lora_alpha = 16,
+    lora_dropout = 0,  # 0 is optimized for Unsloth
+    bias = "none",
+    use_gradient_checkpointing = "unsloth",  # Enables efficient memory usage for long contexts
+    random_state = 3407,
+    use_rslora = False,
+    loftq_config = None,
+)
+```
+
+This setup ensures that the Qwen 2 7B model is loaded efficiently and is ready for parameter-efficient finetuning using Unsloth's optimizations.
 ## Setup
 
 The notebook starts by installing the necessary libraries for finetuning large language models, including `unsloth`, `bitsandbytes`, `accelerate`, `peft`, `trl`, and `datasets`. This is handled in the initial setup cells of the notebook.
@@ -41,102 +102,99 @@ else:
 The dataset for finetuning is loaded using the `load_dataset` function from the `datasets` library. In this case, the `yahma/alpaca-cleaned` dataset is used.
 
 A formatting function, `formatting_prompts_func`, is defined to structure the instruction, input, and output from the dataset into a prompt format suitable for training. The `EOS_TOKEN` is added to the end of each formatted text to indicate the end of a sequence. The dataset is then mapped using this function.
-python
 alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
+### Instruction:
+{}
 
+### Input:
+{}
 
-EOS_TOKEN = tokenizer.eos_token # Must add EOS_TOKEN
+### Response:
+{}
+"""
+
+from datasets import load_dataset
+
+# Ensure tokenizer is defined before using EOS_TOKEN
+EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
+
 def formatting_prompts_func(examples):
     instructions = examples["instruction"]
-    inputs       = examples["input"]
-    outputs      = examples["output"]
+    inputs = examples["input"]
+    outputs = examples["output"]
     texts = []
     for instruction, input, output in zip(instructions, inputs, outputs):
         # Must add EOS_TOKEN, otherwise your generation will go on forever!
         text = alpaca_prompt.format(instruction, input, output) + EOS_TOKEN
         texts.append(text)
-    return { "text" : texts, }
-pass
+    return {"text": texts}
 
-from datasets import load_dataset
-dataset = load_dataset("yahma/alpaca-cleaned", split = "train")
-dataset = dataset.map(formatting_prompts_func, batched = True,)
+dataset = load_dataset("yahma/alpaca-cleaned", split="train")
+dataset = dataset.map(formatting_prompts_func, batched=True)
 
-### Training
-
-The finetuning process is carried out using the `SFTTrainer` from the `trl` library. The trainer is configured with various parameters specified in the `TrainingArguments`. Key parameters include `per_device_train_batch_size`, `gradient_accumulation_steps`, `warmup_steps`, `max_steps`, `learning_rate`, and the optimizer (`adamw_8bit`). The trainer is then started using `trainer.train()`.
-python
 from trl import SFTTrainer
 from transformers import TrainingArguments
 from unsloth import is_bfloat16_supported
 
 trainer = SFTTrainer(
-    model = model,
-    tokenizer = tokenizer,
-    train_dataset = dataset,
-    dataset_text_field = "text",
-    max_seq_length = max_seq_length,
-    dataset_num_proc = 2,
-    args = TrainingArguments(
-        per_device_train_batch_size = 2,
-        gradient_accumulation_steps = 4,
-
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    dataset_text_field="text",
+    max_seq_length=max_seq_length,
+    dataset_num_proc=2,
+    args=TrainingArguments(
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
         # Use num_train_epochs = 1, warmup_ratio for full training runs!
-        warmup_steps = 5,
-        max_steps = 60,
-
-        learning_rate = 2e-4,
-        fp16 = not is_bfloat16_supported(),
-        bf16 = is_bfloat16_supported(),
-        logging_steps = 1,
-        optim = "adamw_8bit",
-        weight_decay = 0.01,
-        lr_scheduler_type = "linear",
-        seed = 3407,
-        output_dir = "outputs",
-        report_to = "none", # Use this for WandB etc
+        warmup_steps=5,
+        max_steps=60,
+        learning_rate=2e-4,
+        fp16=not is_bfloat16_supported(),
+        bf16=is_bfloat16_supported(),
+        logging_steps=1,
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=3407,
+        output_dir="outputs",
+        report_to="none",  # Use this for WandB etc
     ),
-
+)
 
 trainer_stats = trainer.train()
+)
 
-### Inference
-
-After finetuning, the model can be used for inference. `FastLanguageModel.for_inference(model)` is called to enable Unsloth's optimized inference. The input prompt is formatted using the `alpaca_prompt` and the tokenizer. The `model.generate` function is used to generate text based on the input. The `TextStreamer` can be used to stream the generated output.
-python
-# alpaca_prompt 
-FastLanguageModel.for_inference(model) # Unsloth has 2x faster inference!
+FastLanguageModel.for_inference(model)  # Unsloth has 2x faster inference!
 inputs = tokenizer(
-[
-    alpaca_prompt.format(
-        "Continue the fibonnaci sequence.", # instruction
-        "1, 1, 2, 3, 5, 8", # input
-        "", # output - leave this blank for generation!
-    )
-], return_tensors = "pt").to("cuda")
+    [
+        alpaca_prompt.format(
+            "Continue the fibonnaci sequence.",  # instruction
+            "1, 1, 2, 3, 5, 8",  # input
+            "",  # output - leave this blank for generation!
+        )
+    ],
+    return_tensors="pt"
+).to("cuda")
 
-outputs = model.generate(**inputs, max_new_tokens = 64, use_cache = True)
-tokenizer.batch_decode(outputs)
-python
-
+outputs = model.generate(**inputs, max_new_tokens=64, use_cache=True)
+print(tokenizer.batch_decode(outputs))
 
 from transformers import TextStreamer
 text_streamer = TextStreamer(tokenizer)
-_ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 128)
+_ = model.generate(**inputs, streamer=text_streamer, max_new_tokens=128)
 
-### Saving the Model
-
-The finetuned LoRA adapters can be saved locally using `model.save_pretrained("lora_model")` and the tokenizer using `tokenizer.save_pretrained("lora_model")`.
-python
 model.save_pretrained("lora_model")  # Local saving
 tokenizer.save_pretrained("lora_model")
 
-### WandB Logging
+model.save_pretrained("lora_model")  # Local saving
+tokenizer.save_pretrained("lora_model")
 
-Weights & Biases (WandB) is used to log the training process and save the finetuned model as an artifact. After logging in to WandB using `wandb.login()`, a run is initialized with `wandb.init()`. An artifact is created to store the finetuned model directory, and the artifact is logged to the WandB run.
-python
 import wandb
+model.save_pretrained("lora_model")  # Local saving
+tokenizer.save_pretrained("lora_model")
+
 wandb.login()
 
 run = wandb.init(project="qwen2-finetuning", job_type="upload-model")
@@ -156,21 +214,9 @@ run.log_artifact(artifact)
 
 # Finish the WandB run
 run.finish()
-
-## CodeGemma 7B Finetuning
-
-### Model Loading and PEFT Setup
-
-The CodeGemma 7B model is loaded using `FastLanguageModel.from_pretrained` with 4-bit quantization for efficiency. PEFT adapters are then applied using `FastLanguageModel.get_peft_model`, utilizing Unsloth's optimizations for PEFT training.
-python
 from unsloth import FastLanguageModel
-import torch
-
-max_seq_length = 4096  # Gemma sadly only supports max 8192 for now
-dtype = (
-    None  # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
-)
-load_in_4bit = True  # Use 4bit quantization to reduce memory usage. Can be False.
+from unsloth.chat_templates import get_chat_template
+from datasets import load_dataset
 
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name = "unsloth/codegemma-7b-bnb-4bit",  # Choose ANY! eg teknium/OpenHermes-2.5-Mistral-7B
@@ -194,16 +240,12 @@ model = FastLanguageModel.get_peft_model(
     loftq_config = None, # And LoftQ
 )
 
-### Data Preparation
-
-The `philschmid/guanaco-sharegpt-style` dataset is loaded and prepared for training. A chat template, specifically the `chatml` template in this case, is applied to format the conversations into a suitable text format for the model. A formatting function is used to apply this template to batches of data.
-python
-from unsloth.chat_templates import get_chat_template
-from datasets import load_dataset
-
 tokenizer = get_chat_template(
     tokenizer,
     chat_template = "chatml", # Supports zephyr, chatml, mistral, llama, alpaca, vicuna, vicuna_old, unsloth
+    mapping = {"role" : "from", "content" : "value", "user" : "human", "assistant" : "gpt"}, # ShareGPT style
+    map_eos_token = True, # Maps <|im_end|> to </s> instead
+)
     mapping = {"role" : "from", "content" : "value", "user" : "human", "assistant" : "gpt"}, # ShareGPT style
     map_eos_token = True, # Maps <|im_end|> to </s> instead
 )
@@ -212,15 +254,17 @@ def formatting_prompts_func(examples):
     convos = examples["conversations"]
     texts = [tokenizer.apply_chat_template(convo, tokenize = False, add_generation_prompt = False) for convo in convos]
     return { "text" : texts, }
-pass
 
 dataset = load_dataset("philschmid/guanaco-sharegpt-style", split = "train")
 dataset = dataset.map(formatting_prompts_func, batched = True,)
+def formatting_prompts_func(examples):
+    convos = examples["conversations"]
+    texts = [tokenizer.apply_chat_template(convo, tokenize = False, add_generation_prompt = False) for convo in convos]
+    return { "text" : texts, }
 
-### Training
+dataset = load_dataset("philschmid/guanaco-sharegpt-style", split = "train")
+dataset = dataset.map(formatting_prompts_func, batched = True)
 
-The `SFTTrainer` from the `trl` library is used for finetuning the CodeGemma model. The training is configured using `SFTConfig`, specifying parameters like batch size, gradient accumulation steps, warmup steps, maximum steps, learning rate, and the optimizer.
-python
 from trl import SFTTrainer, SFTConfig
 
 trainer = SFTTrainer(
@@ -245,20 +289,27 @@ trainer = SFTTrainer(
 )
 
 trainer_stats = trainer.train()
+    messages,
+    tokenize = True,
+    add_generation_prompt = True, # Must add for generation
+    return_tensors = "pt",
+).to("cuda")
 
-### Inference
+outputs = model.generate(input_ids = inputs, max_new_tokens = 64, use_cache = True)
+tokenizer.batch_decode(outputs)
 
-After finetuning, inference can be performed using the model. `FastLanguageModel.for_inference(model)` enables Unsloth's optimized inference. The input messages are formatted using `tokenizer.apply_chat_template`, and `model.generate` is used to produce the output. The `TextStreamer` can be used for streaming the output.
-python
-from unsloth.chat_templates import get_chat_template
+text_streamer = TextStreamer(tokenizer)
+_ = model.generate(input_ids = inputs, streamer = text_streamer, max_new_tokens = 128, use_cache = True)
+
+You can merge the finetuned LoRA adapters with the base model into different formats using `model.save_pretrained_merged` or push them to the Hugging Face Hub using `model.push_to_hub_merged`.
+
+To merge to a 16-bit format:python
+# Merge to 16bit
+if False: model.save_pretrained_merged("model", tokenizer, save_method = "merged_16bit",)
+if False: model.push_to_hub_merged("hf/model", tokenizer, save_method = "merged_16bit", token = "")
+
+To merge to a 4-bit format:python
 from transformers import TextStreamer
-
-tokenizer = get_chat_template(
-    tokenizer,
-    chat_template = "chatml", # Supports zephyr, chatml, mistral, llama, alpaca, vicuna, vicuna_old, unsloth
-    mapping = {"role" : "from", "content" : "value", "user" : "human", "assistant" : "gpt"}, # ShareGPT style
-    map_eos_token = True, # Maps <|im_end|> to </s> instead
-)
 
 FastLanguageModel.for_inference(model) # Enable native 2x faster inference
 
@@ -273,60 +324,10 @@ inputs = tokenizer.apply_chat_template(
 ).to("cuda")
 
 outputs = model.generate(input_ids = inputs, max_new_tokens = 64, use_cache = True)
-tokenizer.batch_decode(outputs)
-
-FastLanguageModel.for_inference(model) # Enable native 2x faster inference
-
-messages = [
-    {"from": "human", "value": "Continue the fibonnaci sequence: 1, 1, 2, 3, 5, 8,"},
-]
-inputs = tokenizer.apply_chat_template(
-    messages,
-    tokenize = True,
-    add_generation_prompt = True, # Must add for generation
-    return_tensors = "pt",
-).to("cuda")
+print(tokenizer.batch_decode(outputs))
 
 text_streamer = TextStreamer(tokenizer)
 _ = model.generate(input_ids = inputs, streamer = text_streamer, max_new_tokens = 128, use_cache = True)
-
-### Saving the Model
-
-The finetuned LoRA adapters for the CodeGemma model can be saved locally using `model.save_pretrained("lora_model")`.
-python
-model.save_pretrained("lora_model")  # Local saving
-# Merging and Quantization
-
-After finetuning the LoRA adapters, you can merge them with the base model or quantize the model for more efficient deployment. Unsloth provides convenient methods for these operations.
-
-### Merging LoRA Adapters
-
-You can merge the finetuned LoRA adapters with the base model into different formats using `model.save_pretrained_merged` or push them to the Hugging Face Hub using `model.push_to_hub_merged`.
-
-To merge to a 16-bit format:python
-# Merge to 16bit
-if False: model.save_pretrained_merged("model", tokenizer, save_method = "merged_16bit",)
-if False: model.push_to_hub_merged("hf/model", tokenizer, save_method = "merged_16bit", token = "")
-
-To merge to a 4-bit format:python
-# Merge to 4bit
-if False: model.save_pretrained_merged("model", tokenizer, save_method = "merged_4bit",)
-if False: model.push_to_hub_merged("hf/model", tokenizer, save_method = "merged_4bit", token = "")
-
-You can also save or push just the LoRA adapters without merging:python
-# Just LoRA adapters
-if False:
-    model.save_pretrained("model")
-    tokenizer.save_pretrained("model")
-if False:
-    model.push_to_hub("hf/model", token = "")
-    tokenizer.push_to_hub("hf/model", token = "")
-
-### Quantization
-
-Unsloth supports various quantization methods for the merged model using `model.save_pretrained_gguf` or `model.push_to_hub_gguf`.
-
-To save to 8-bit Q8_0 GGUF format:python
 # Save to 8bit Q8_0
 if False: model.save_pretrained_gguf("model", tokenizer,)
 if False: model.push_to_hub_gguf("hf/model", tokenizer, token = "")
