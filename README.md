@@ -44,14 +44,7 @@ A formatting function, `formatting_prompts_func`, is defined to structure the in
 python
 alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
-### Instruction:
-{}
 
-### Input:
-{}
-
-### Response:
-{}"""
 
 EOS_TOKEN = tokenizer.eos_token # Must add EOS_TOKEN
 def formatting_prompts_func(examples):
@@ -104,7 +97,7 @@ trainer = SFTTrainer(
         output_dir = "outputs",
         report_to = "none", # Use this for WandB etc
     ),
-)
+
 
 trainer_stats = trainer.train()
 
@@ -112,7 +105,7 @@ trainer_stats = trainer.train()
 
 After finetuning, the model can be used for inference. `FastLanguageModel.for_inference(model)` is called to enable Unsloth's optimized inference. The input prompt is formatted using the `alpaca_prompt` and the tokenizer. The `model.generate` function is used to generate text based on the input. The `TextStreamer` can be used to stream the generated output.
 python
-# alpaca_prompt = Copied from above
+# alpaca_prompt 
 FastLanguageModel.for_inference(model) # Unsloth has 2x faster inference!
 inputs = tokenizer(
 [
@@ -126,16 +119,7 @@ inputs = tokenizer(
 outputs = model.generate(**inputs, max_new_tokens = 64, use_cache = True)
 tokenizer.batch_decode(outputs)
 python
-# alpaca_prompt = Copied from above
-FastLanguageModel.for_inference(model) # Unsloth has 2x faster inference!
-inputs = tokenizer(
-[
-    alpaca_prompt.format(
-        "Continue the fibonnaci sequence.", # instruction
-        "1, 1, 2, 3, 5, 8", # input
-        "", # output - leave this blank for generation!
-    )
-], return_tensors = "pt").to("cuda")
+
 
 from transformers import TextStreamer
 text_streamer = TextStreamer(tokenizer)
